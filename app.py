@@ -208,7 +208,158 @@ def get_taxa_real_vertice_1638():
             continue
     return 0.064, "Erro/Fallback"
 
-# --- 3. INTEGRAÇÃO COMDINHEIRO (HARDCODED PAYLOAD) ---
+@st.cache_data
+def get_taxa_real_ex_ante_252():
+    """Busca taxa real ex-ante (DI x IPCA) do vértice 252 dias úteis (1 ano) da ETTJ ANBIMA"""
+    for i in range(0, 10):
+        data_busca = datetime.now() - timedelta(days=i)
+        # Pula finais de semana
+        if data_busca.weekday() >= 5:
+            continue
+        
+        data_str = data_busca.strftime("%d/%m/%Y")
+        try:
+            resultado = pyettj.get_ettj_anbima(data_str)
+            curva = resultado[1]  # DataFrame de vértices
+            
+            if not curva.empty and 'Vertice' in curva.columns and 'IPCA' in curva.columns:
+                # Converte colunas para numérico
+                curva['Vertice'] = curva['Vertice'].apply(lambda x: str(x).replace('.', ''))
+                curva['Vertice'] = pd.to_numeric(curva['Vertice'], errors='coerce')
+                curva['IPCA'] = curva['IPCA'].apply(
+                    lambda x: float(str(x).replace(',', '.')) if pd.notna(x) and str(x).strip() != '' else None
+                )
+                curva = curva.dropna(subset=['Vertice', 'IPCA'])
+                curva = curva.sort_values('Vertice')
+                
+                # Busca vértice 252 dias úteis (1 ano)
+                if 252 in curva['Vertice'].values:
+                    taxa = curva[curva['Vertice'] == 252]['IPCA'].iloc[0]
+                    valor_interpolado = False
+                else:
+                    # Interpola se não existir exato
+                    f_interp = interpolate.interp1d(curva['Vertice'], curva['IPCA'], 
+                                                   kind='linear', fill_value="extrapolate")
+                    taxa = float(f_interp(252))
+                    valor_interpolado = True
+                
+                # Debug
+                st.session_state['debug_ettj_real_exante'] = {
+                    'data': data_str,
+                    'vertice_252_existe': (252 in curva['Vertice'].values),
+                    'taxa_retornada': taxa,
+                    'foi_interpolado': valor_interpolado
+                }
+                
+                return taxa / 100, data_str
+        except Exception as e:
+            st.session_state['debug_ettj_real_exante_error'] = str(e)
+            continue
+    return 0.05, "Erro/Fallback"
+
+# --- 3. FUNÇÕES DE OTIMIZAÇÃO ---
+
+def black_litterman(S, market_caps, tau, P, Q, omega):
+    """
+    Implementação do modelo Black-Litterman
+    
+    Args:
+        S: Matriz de covariância (numpy array)
+        market_caps: Pesos de equilíbrio de mercado (numpy array)
+        tau: Parâmetro de incerteza (scalar, tipicamente entre 0.01 e 0.05)
+        P: Matriz de views (numpy array) - cada linha é uma view
+        Q: Vetor de retornos esperados das views (numpy array)
+        omega: Matriz de incerteza das views (numpy array, diagonal)
+    
+    Returns:
+        mu_bl: Retornos esperados ajustados pelo Black-Litterman
+    """
+    # Calcula o vetor de retornos implícitos do mercado (Pi)
+    # Assume risk aversion = 2.5 (típico)
+    risk_aversion = 2.5
+    pi = risk_aversion * S @ market_caps
+    
+    # Fórmula do Black-Litterman
+    # mu_BL = [(tau*S)^-1 + P'*Omega^-1*P]^-1 * [(tau*S)^-1*Pi + P'*Omega^-1*Q]
+    tau_S = tau * S
+    tau_S_inv = np.linalg.inv(tau_S)
+    
+    omega_inv = np.linalg.inv(omega)
+    
+    # Termo da esquerda: [(tau*S)^-1 + P'*Omega^-1*P]^-1
+    left_term = np.linalg.inv(tau_S_inv + P.T @ omega_inv @ P)
+    
+    # Termo da direita: [(tau*S)^-1*Pi + P'*Omega^-1*Q]
+    right_term = tau_S_inv @ pi + P.T @ omega_inv @ Q
+    
+    # Retorno esperado ajustado
+    mu_bl = left_term @ right_term
+    
+    return mu_bl
+
+def risk_parity_optimization(S, vol_target=None):
+    """
+    Otimização Risk Parity - equaliza contribuição de risco
+    
+    Args:
+        S: Matriz de covariância (numpy array)
+        vol_target: Volatilidade alvo anual (opcional). Se None, retorna pesos não alavancados
+    
+    Returns:
+        weights: Pesos otimizados (numpy array)
+    """
+    num_assets = S.shape[0]
+    
+    # Função objetivo: minimizar a diferença entre contribuições de risco
+    def risk_contribution_diff(w):
+        """Calcula diferença entre contribuições de risco (queremos minimizar)"""
+        portfolio_var = w.T @ S @ w
+        portfolio_vol = np.sqrt(portfolio_var)
+        
+        # Contribuição marginal de risco
+        marginal_contrib = S @ w
+        
+        # Contribuição de risco de cada ativo
+        risk_contrib = w * marginal_contrib / portfolio_vol if portfolio_vol > 0 else w * 0
+        
+        # Contribuição de risco alvo (igual para todos)
+        target_contrib = portfolio_var / num_assets
+        
+        # Soma dos quadrados das diferenças
+        return np.sum((risk_contrib - target_contrib)**2)
+    
+    # Chute inicial: pesos iguais
+    init_guess = num_assets * [1. / num_assets,]
+    
+    # Restrições: soma = 1, todos positivos
+    constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+    bounds = tuple((0, 1) for _ in range(num_assets))
+    
+    # Otimização
+    result = minimize(
+        risk_contribution_diff,
+        init_guess,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints,
+        options={'maxiter': 1000, 'ftol': 1e-9}
+    )
+    
+    if result.success:
+        weights = result.x
+        
+        # Se houver target de volatilidade, aplica alavancagem
+        if vol_target is not None:
+            current_vol = np.sqrt(weights.T @ S @ weights)
+            leverage = vol_target / current_vol if current_vol > 0 else 1
+            weights = weights * leverage
+        
+        return weights
+    else:
+        # Fallback: pesos iguais
+        return np.array(init_guess)
+
+# --- 4. INTEGRAÇÃO COMDINHEIRO (HARDCODED PAYLOAD) ---
 def fetch_comdinheiro_data(user, password):
     """
     Usa a string exata fornecida pelo suporte da Comdinheiro, apenas injetando o login.
@@ -354,7 +505,9 @@ with st.spinner('Sincronizando dados macroeconômicos...'):
     df_hist, media_juro_real_5y = get_historico_real()
     taxa_di_1y, data_ettj = get_ettj_1ano()
     expectativa_ipca = get_expectativa_inflacao_12m()
-    juro_real_ex_ante = ((1 + taxa_di_1y) / (1 + expectativa_ipca)) - 1
+    
+    # Busca taxa real ex-ante diretamente da ETTJ IPCA 252 dias
+    taxa_real_ex_ante, data_real_exante = get_taxa_real_ex_ante_252()
     
     # Busca taxas dos vértices específicos da ETTJ
     taxa_pre_504, data_pre_504 = get_taxa_pre_vertice_504()
@@ -362,6 +515,8 @@ with st.spinner('Sincronizando dados macroeconômicos...'):
 
     if 'taxa_di_1y' not in st.session_state: st.session_state['taxa_di_1y'] = taxa_di_1y
     if 'data_ettj' not in st.session_state: st.session_state['data_ettj'] = data_ettj
+    if 'taxa_real_ex_ante' not in st.session_state: st.session_state['taxa_real_ex_ante'] = taxa_real_ex_ante
+    if 'data_real_exante' not in st.session_state: st.session_state['data_real_exante'] = data_real_exante
     if 'taxa_pre_504' not in st.session_state: st.session_state['taxa_pre_504'] = taxa_pre_504
     if 'data_pre_504' not in st.session_state: st.session_state['data_pre_504'] = data_pre_504
     if 'taxa_real_1638' not in st.session_state: st.session_state['taxa_real_1638'] = taxa_real_1638
@@ -417,16 +572,42 @@ if pagina == "Benchmark":
     with col_left:
         st.info("**Visão Histórica (Ex-Post)**\n\nRetorno acumulado de 12 meses do CDI descontado pelo IPCA realizado no mesmo período.")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Média Desde 2005", f"{media_total_ex_post*100:.2f}%")
-        c2.metric("Média 5 Anos", f"{media_5y_ex_post*100:.2f}%", help="Média móvel dos últimos 60 meses")
-        c3.metric(f"Atual ({data_ultimo})", f"{atual_ex_post*100:.2f}%", delta=f"{(atual_ex_post - media_5y_ex_post)*100:.2f} p.p vs média")
+        c1.metric(
+            "Média Desde 2005", 
+            f"{media_total_ex_post*100:.2f}%",
+            help="Média aritmética simples do juro real ex-post de todos os meses desde janeiro/2005. Representa o retorno médio histórico do CDI acima da inflação em períodos normais e de crise."
+        )
+        c2.metric(
+            "Média 5 Anos", 
+            f"{media_5y_ex_post*100:.2f}%", 
+            help="Média móvel dos últimos 60 meses (5 anos). Captura tendências mais recentes e é menos influenciada por períodos antigos de juro real elevado (2015-2016). Recomendada para benchmarks de médio prazo."
+        )
+        c3.metric(
+            f"Atual ({data_ultimo})", 
+            f"{atual_ex_post*100:.2f}%", 
+            delta=f"{(atual_ex_post - media_5y_ex_post)*100:.2f} p.p vs média",
+            help=f"Juro real realizado nos últimos 12 meses (acumulado móvel até {data_ultimo}). Calculado como: [(1+CDI acum)/(1+IPCA acum)] - 1. O delta mostra quantos pontos percentuais está acima/abaixo da média de 5 anos."
+        )
 
     with col_right:
-        st.warning(f"**Visão Mercado (Ex-Ante)**\n\nExpectativa implícita na Curva de Juros ({data_ettj}) e IPCA esperado pelo Focus.")
+        st.warning(f"**Visão Mercado (Ex-Ante)**\n\nExpectativa implícita na Curva de Juros ANBIMA e IPCA esperado pelo mercado.")
         c4, c5 = st.columns(2)
-        c4.metric("DI Futuro (1Y)", f"{taxa_di_1y*100:.2f}%", help="Taxa Pré extraída da ETTJ (Interpolada 365 dias)")
-        c5.metric("IPCA Focus (12m)", f"{expectativa_ipca*100:.2f}%", help="Mediana das expectativas do Focus")
-        st.metric("Juro Real Projetado (12 Meses)", f"{juro_real_ex_ante*100:.2f}%", delta="Target de Mercado")
+        c4.metric(
+            "DI Futuro (1Y)", 
+            f"{taxa_di_1y*100:.2f}%", 
+            help=f"Taxa pré-fixada extraída da Estrutura a Termo da Taxa de Juros (ETTJ) da ANBIMA para o vértice de 365 dias corridos. Representa a expectativa do mercado para o CDI médio nos próximos 12 meses. Data: {data_ettj}"
+        )
+        c5.metric(
+            "IPCA Focus (12m)", 
+            f"{expectativa_ipca*100:.2f}%", 
+            help="Mediana das expectativas de inflação para os próximos 12 meses coletadas pelo Banco Central no Boletim Focus. Atualizado semanalmente com as projeções de cerca de 100 instituições financeiras."
+        )
+        st.metric(
+            "Juro Real Ex-Ante (1Y)", 
+            f"{taxa_real_ex_ante*100:.2f}%", 
+            delta="Taxa de Mercado",
+            help=f"Taxa real (DI x IPCA) implícita na curva ANBIMA para o vértice de 252 dias úteis (1 ano). Extraída diretamente da ETTJ IPCA, reflete a expectativa do mercado de juro real para os próximos 12 meses. Data: {data_real_exante}"
+        )
 
     st.divider()
 
@@ -470,15 +651,29 @@ if pagina == "Benchmark":
         peso_mkt = 1 - peso_hist
         st.caption(f"Histórico ({label_periodo}): {peso_hist*100:.0f}% | Mercado (Ex-Ante): {peso_mkt*100:.0f}%")
     
-    benchmark_calc = (media_hist_selecionada * peso_hist) + (juro_real_ex_ante * peso_mkt)
+    benchmark_calc = (media_hist_selecionada * peso_hist) + (taxa_real_ex_ante * peso_mkt)
     
     with col_in2:
         st.markdown("**Benchmark Calculado (IPCA + X%)**")
-        st.metric("Target Final Sugerido", f"{benchmark_calc*100:.2f}%")
+        st.metric(
+            "Target Final Sugerido", 
+            f"{benchmark_calc*100:.2f}%",
+            help=f"Meta de juro real híbrida calculada como: ({peso_hist*100:.0f}% × {media_hist_selecionada*100:.2f}% histórico) + ({peso_mkt*100:.0f}% × {taxa_real_ex_ante*100:.2f}% mercado). Esta será a meta de retorno real das carteiras (IPCA + X%). Carteiras conservadoras terão meta inferior, agressivas superior."
+        )
         
-        override = st.checkbox("Sobrepor valor calculado manualmente?", value=saved_benchmark_config['override'], key="override_checkbox")
+        override = st.checkbox(
+            "Sobrepor valor calculado manualmente?", 
+            value=saved_benchmark_config['override'], 
+            key="override_checkbox",
+            help="Marque esta opção para ignorar o cálculo automático e definir uma meta customizada. Útil quando você tem uma expectativa específica que difere do modelo."
+        )
         if override:
-            benchmark_final = st.number_input("Target Manual (%)", value=float(saved_benchmark_config['valor_manual']), key="valor_manual_input") / 100
+            benchmark_final = st.number_input(
+                "Target Manual (%)", 
+                value=float(saved_benchmark_config['valor_manual']), 
+                key="valor_manual_input",
+                help="Meta de juro real customizada em % ao ano. Exemplo: 6.0% significa meta de IPCA + 6% a.a."
+            ) / 100
         else:
             benchmark_final = benchmark_calc
 
@@ -527,9 +722,27 @@ elif pagina == "Cenários Macro":
     saved_probs = st.session_state.get('probabilidades_salvas', default_probs)
     
     col_prob1, col_prob2, col_prob3, col_check = st.columns(4)
-    with col_prob1: prob_bear = st.number_input("Prob. Bear (%)", 0.0, 100.0, saved_probs['bear'], 5.0, key="prob_bear") / 100
-    with col_prob2: prob_neutro = st.number_input("Prob. Neutro (%)", 0.0, 100.0, saved_probs['neutro'], 5.0, key="prob_neutro") / 100
-    with col_prob3: prob_bull = st.number_input("Prob. Bull (%)", 0.0, 100.0, saved_probs['bull'], 5.0, key="prob_bull") / 100
+    with col_prob1: 
+        prob_bear = st.number_input(
+            "Prob. Bear (%)", 
+            0.0, 100.0, saved_probs['bear'], 5.0, 
+            key="prob_bear",
+            help="Probabilidade de ocorrência do cenário pessimista (Bear). Considera recessão, crise política, aperto monetário severo, fuga de capital, etc."
+        ) / 100
+    with col_prob2: 
+        prob_neutro = st.number_input(
+            "Prob. Neutro (%)", 
+            0.0, 100.0, saved_probs['neutro'], 5.0, 
+            key="prob_neutro",
+            help="Probabilidade de manutenção do status quo. Crescimento moderado, inflação controlada, sem grandes mudanças macroeconômicas."
+        ) / 100
+    with col_prob3: 
+        prob_bull = st.number_input(
+            "Prob. Bull (%)", 
+            0.0, 100.0, saved_probs['bull'], 5.0, 
+            key="prob_bull",
+            help="Probabilidade do cenário otimista (Bull). Reforma estrutural, aceleração do crescimento, queda de juros, melhora fiscal, rally de ativos."
+        ) / 100
     
     soma = prob_bear + prob_neutro + prob_bull
     with col_check:
@@ -629,14 +842,32 @@ elif pagina == "Cenários Macro":
     
     with st.expander("Expandir Configurações de Taxas e Duration", expanded=True):
         col_mkt1, col_mkt2, col_mkt3, col_mkt4 = st.columns(4)
-        taxa_pre_mercado = col_mkt1.number_input("Taxa Pré (Nominal) Hoje %", value=saved_params['taxa_pre'], format="%.2f", 
-                                                 key="taxa_pre", help="Vértice 504 dias da ETTJ Pré")
-        duration_pre = col_mkt2.number_input("Duration Pré (Anos)", value=saved_params['duration_pre'], 
-                                             help="Sensibilidade da carteira IRF-M", key="dur_pre")
-        taxa_real_mercado = col_mkt3.number_input("Taxa Real (NTN-B) Hoje %", value=saved_params['taxa_real'], format="%.2f", 
-                                                  key="taxa_real", help="Vértice 1638 dias da DI x IPCA 252")
-        duration_imab = col_mkt4.number_input("Duration IMA-B (Anos)", value=saved_params['duration_imab'], 
-                                              help="Sensibilidade da carteira IMA-B", key="dur_imab")
+        taxa_pre_mercado = col_mkt1.number_input(
+            "Taxa Pré (Nominal) Hoje %", 
+            value=saved_params['taxa_pre'], 
+            format="%.2f", 
+            key="taxa_pre", 
+            help="Taxa pré-fixada de mercado extraída do vértice 504 dias úteis da ETTJ ANBIMA. Usada como referência para calcular ganho/perda de capital no IRF-M quando a curva se move nos cenários."
+        )
+        duration_pre = col_mkt2.number_input(
+            "Duration Pré (Anos)", 
+            value=saved_params['duration_pre'], 
+            key="dur_pre",
+            help="Duration modificada da carteira de títulos pré-fixados (IRF-M). Representa a sensibilidade do preço a variações de 1% na taxa. Exemplo: Duration 2 anos → queda de 1% na taxa = ganho de 2% no preço."
+        )
+        taxa_real_mercado = col_mkt3.number_input(
+            "Taxa Real (NTN-B) Hoje %", 
+            value=saved_params['taxa_real'], 
+            format="%.2f", 
+            key="taxa_real", 
+            help="Taxa real (IPCA+) de mercado extraída do vértice 1638 dias úteis da ETTJ ANBIMA (DI x IPCA 252). Usada para calcular marcação a mercado do IMA-B quando a taxa real muda nos cenários."
+        )
+        duration_imab = col_mkt4.number_input(
+            "Duration IMA-B (Anos)", 
+            value=saved_params['duration_imab'], 
+            key="dur_imab",
+            help="Duration modificada da carteira de títulos indexados ao IPCA (IMA-B). Sensibilidade do preço a variações de 1% na taxa real. Exemplo: Duration 6.5 anos → queda de 1% na taxa real = ganho de 6.5% no preço."
+        )
     
     # Botões salvar/restaurar parâmetros
     col_save_params, col_reset_params = st.columns([1, 1])
@@ -752,9 +983,9 @@ elif pagina == "Cenários Macro":
     
     st.session_state['premissas_retorno'] = df_ativos
 
-# === PÁGINA 3: OTIMIZAÇÃO (MARKOWITZ) ===
+# === PÁGINA 3: OTIMIZAÇÃO ===
 elif pagina == "Otimização":
-    st.title("Otimização de Portfólio (Markowitz)")
+    st.title("Otimização de Portfólio")
     
     if 'premissas_retorno' not in st.session_state:
         st.error("⚠️ Atenção: Você precisa definir os Cenários na Fase B antes de prosseguir.")
@@ -763,19 +994,161 @@ elif pagina == "Otimização":
     df_premissas = st.session_state['premissas_retorno']
     bench_base = st.session_state.get('benchmark_final', 0.06)
     
-    # Seletor de modo de otimização
+    # Seletor de MÉTODO principal
     st.markdown("### 🎯 Método de Otimização")
-    modo_otimizacao = st.radio(
-        "Escolha o critério de otimização:",
-        options=["Máximo Sharpe Ratio", "Mínima Variância"],
-        help="**Máximo Sharpe Ratio**: Melhor relação retorno/risco | **Mínima Variância**: Carteira com menor volatilidade possível",
+    metodo_principal = st.radio(
+        "Escolha o método:",
+        options=["Markowitz (MVO)", "Black-Litterman", "Risk Parity"],
+        help="""
+        **Markowitz**: Otimização clássica baseada em retorno/risco histórico
+        **Black-Litterman**: Combina equilíbrio de mercado com suas views subjetivas
+        **Risk Parity**: Equaliza contribuição de risco (ignora retornos esperados)
+        """,
         horizontal=True
     )
     
+    # Sub-opções para Markowitz
+    if metodo_principal == "Markowitz (MVO)":
+        modo_markowitz = st.radio(
+            "Critério de otimização:",
+            options=["Máximo Sharpe Ratio", "Mínima Variância"],
+            help="**Máximo Sharpe Ratio**: Melhor relação retorno/risco | **Mínima Variância**: Menor volatilidade",
+            horizontal=True,
+            key="modo_markowitz"
+        )
+    
+    # === EXPLICAÇÃO DOS MÉTODOS ===
+    with st.expander("📖 Entenda os Métodos de Otimização", expanded=False):
+        st.markdown("""
+        ### **1. Markowitz (Mean-Variance Optimization)**
+        - **Input**: Retornos esperados + Matriz de covariância
+        - **Output**: Carteira que maximiza Sharpe ou minimiza variância
+        - **Prós**: Simples, intuitivo, base da teoria moderna de portfólio
+        - **Contras**: Sensível a erros nas estimativas de retorno (garbage in, garbage out)
+        
+        ---
+        
+        ### **2. Black-Litterman**
+        - **Input**: Equilíbrio de mercado (market caps) + Views subjetivas do gestor + Covariância
+        - **Output**: Retornos ajustados que combinam mercado e opinião, aplicados no Markowitz
+        - **Prós**: Incorpora views qualitativas, reduz extremos, mais estável
+        - **Contras**: Requer definição de market caps e confiança nas views
+        - **Quando usar**: Quando você tem convicções fortes sobre alguns ativos (ex: "IBOV vai render 20%")
+        
+        ---
+        
+        ### **3. Risk Parity**
+        - **Input**: Apenas matriz de covariância (ignora retornos esperados!)
+        - **Output**: Carteira onde cada ativo contribui igualmente para o risco total
+        - **Prós**: Não depende de estimativas de retorno, muito estável, bom para diversificação
+        - **Contras**: Pode alocar muito em ativos de baixo retorno/baixa volatilidade
+        - **Quando usar**: Quando não confia nas projeções de retorno ou busca máxima diversificação
+        
+        ---
+        
+        **💡 Dica**: Rode os 3 métodos e compare os resultados! Muitos gestores usam uma combinação dos três.
+        """)
+    
     st.markdown("""
-    Esta etapa calcula a **Fronteira Eficiente** utilizando as premissas de retorno definidas na Fase B
+    Esta etapa calcula a alocação ótima utilizando as premissas de retorno definidas na Fase B
     e uma matriz de covariância histórica para estimar o risco.
     """)
+    
+    st.divider()
+    
+    # === BLACK-LITTERMAN: Interface para Views ===
+    if metodo_principal == "Black-Litterman":
+        st.markdown("### 📝 Definição de Views (Black-Litterman)")
+        st.markdown("""
+        Defina suas expectativas (views) sobre o desempenho de ativos específicos.
+        O modelo combinará suas views com o equilíbrio de mercado para gerar retornos ajustados.
+        """)
+        
+        ativos = df_premissas.index.tolist()
+        
+        # Pesos de equilíbrio (market caps) - pode ser ajustado manualmente
+        st.subheader("Pesos de Equilíbrio (Market Cap)")
+        st.caption("Distribua 100% entre os ativos conforme a representatividade de mercado.")
+        
+        default_market_caps = [0.0, 30.0, 25.0, 10.0, 10.0, 15.0, 5.0, 5.0]  # Exemplo
+        
+        if 'market_caps_bl' not in st.session_state:
+            st.session_state['market_caps_bl'] = default_market_caps
+        
+        df_market_caps = pd.DataFrame({
+            "Ativo": ativos,
+            "Market Cap (%)": st.session_state['market_caps_bl']
+        })
+        
+        df_market_caps_edit = st.data_editor(
+            df_market_caps,
+            column_config={
+                "Market Cap (%)": st.column_config.NumberColumn(min_value=0, max_value=100, format="%.1f%%")
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="market_caps_editor"
+        )
+        
+        soma_market = df_market_caps_edit['Market Cap (%)'].sum()
+        if abs(soma_market - 100) > 0.1:
+            st.error(f"⚠️ Soma dos Market Caps: {soma_market:.1f}% (deve ser 100%)")
+        else:
+            st.success(f"✓ Soma: {soma_market:.1f}%")
+            st.session_state['market_caps_bl'] = df_market_caps_edit['Market Cap (%)'].tolist()
+        
+        st.divider()
+        
+        # Interface para adicionar views
+        st.subheader("Views Subjetivas")
+        st.caption("Adicione suas expectativas de retorno para ativos específicos (ex: 'IBOV vai render 20% no próximo ano')")
+        
+        # Inicializa lista de views
+        if 'bl_views' not in st.session_state:
+            st.session_state['bl_views'] = []
+        
+        # Formulário para adicionar nova view
+        with st.expander("➕ Adicionar Nova View", expanded=len(st.session_state['bl_views']) == 0):
+            col_ativo, col_ret, col_conf = st.columns([2, 1, 1])
+            view_ativo = col_ativo.selectbox("Ativo", ativos, key="new_view_ativo")
+            view_retorno = col_ret.number_input("Retorno Esperado (%)", value=15.0, format="%.2f", key="new_view_ret")
+            view_confianca = col_conf.slider("Confiança", 1, 10, 5, help="1=Baixa, 10=Alta", key="new_view_conf")
+            
+            if st.button("Adicionar View", key="add_view_btn"):
+                st.session_state['bl_views'].append({
+                    'ativo': view_ativo,
+                    'retorno': view_retorno,
+                    'confianca': view_confianca
+                })
+                st.rerun()
+        
+        # Mostra views adicionadas
+        if st.session_state['bl_views']:
+            st.markdown("**Views Configuradas:**")
+            for i, view in enumerate(st.session_state['bl_views']):
+                col1, col2 = st.columns([4, 1])
+                col1.info(f"**{view['ativo']}**: Retorno esperado de **{view['retorno']:.2f}%** (Confiança: {view['confianca']}/10)")
+                if col2.button("🗑️", key=f"del_view_{i}"):
+                    st.session_state['bl_views'].pop(i)
+                    st.rerun()
+        else:
+            st.warning("⚠️ Nenhuma view configurada. O modelo usará apenas o equilíbrio de mercado.")
+    
+    # === RISK PARITY: Configurações ===
+    elif metodo_principal == "Risk Parity":
+        st.markdown("### ⚖️ Configurações Risk Parity")
+        st.info("""
+        Risk Parity equaliza a **contribuição de risco** de cada ativo, não seus pesos.
+        Ativos menos voláteis terão pesos maiores para equilibrar o risco total.
+        """)
+        
+        use_vol_target = st.checkbox("Definir Target de Volatilidade", value=False, 
+                                     help="Se marcado, ajusta alavancagem para atingir volatilidade específica")
+        
+        if use_vol_target:
+            vol_target_rp = st.number_input("Volatilidade Alvo (% a.a.)", value=8.0, min_value=1.0, max_value=30.0, format="%.1f") / 100
+        else:
+            vol_target_rp = None
 
     # 1. Definição de Perfil
     st.divider()
@@ -869,13 +1242,16 @@ elif pagina == "Otimização":
     st.divider()
 
     # 2. Dados e Cálculo
-    # Título dinâmico baseado no método selecionado
-    if modo_otimizacao == "Máximo Sharpe Ratio":
-        st.markdown("### 2. Otimização de Carteira (Sharpe Ratio)")
-        st.markdown("O sistema buscará a combinação de ativos que **maximiza o Sharpe Ratio** (melhor relação retorno/risco) respeitando os limites definidos.")
+    st.markdown("### 2. Otimização de Carteira")
+    if metodo_principal == "Markowitz (MVO)":
+        if modo_markowitz == "Máximo Sharpe Ratio":
+            st.markdown("O sistema buscará a combinação de ativos que **maximiza o Sharpe Ratio** (melhor relação retorno/risco) respeitando os limites definidos.")
+        else:
+            st.markdown("O sistema buscará a combinação de ativos com **menor volatilidade possível**, respeitando os limites definidos.")
+    elif metodo_principal == "Black-Litterman":
+        st.markdown("O modelo combinará suas views com o equilíbrio de mercado para gerar alocação otimizada.")
     else:
-        st.markdown("### 2. Otimização de Carteira (Mínima Variância)")
-        st.markdown("O sistema buscará a combinação de ativos com **menor volatilidade possível**, respeitando os limites definidos.")
+        st.markdown("O modelo equalizará a **contribuição de risco** de cada ativo na carteira.")
     
     # Botão para baixar dados da API (uma vez só)
     col_btn1, col_btn2 = st.columns([1, 1])
@@ -979,35 +1355,103 @@ elif pagina == "Otimização":
             # Usa CDI como proxy de risk-free (média histórica anualizada)
             risk_free_rate = df_returns_aligned.iloc[:, 0].mean() * 252 if 'CDI' in ativos_esperados[0] else 0.0
             
-            # 2.1. Otimização baseada no modo selecionado
+            # 2.1. OTIMIZAÇÃO: Executa método selecionado
             try:
-                if modo_otimizacao == "Máximo Sharpe Ratio":
-                    # Modo 1: MAXIMIZAR SHARPE RATIO (melhor retorno ajustado ao risco)
+                # ========== MÉTODO 1: MARKOWITZ ==========
+                if metodo_principal == "Markowitz (MVO)":
+                    if modo_markowitz == "Máximo Sharpe Ratio":
+                        # Maximizar Sharpe Ratio
+                        constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                        
+                        opt_result = minimize(
+                            neg_sharpe_ratio, 
+                            init_guess, 
+                            args=(mu, S, risk_free_rate), 
+                            method='SLSQP', 
+                            bounds=bounds, 
+                            constraints=constraints,
+                            options={'maxiter': 1000, 'ftol': 1e-9}
+                        )
+                    else:
+                        # Minimizar Variância
+                        constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                        
+                        opt_result = minimize(
+                            portfolio_vol,
+                            init_guess,
+                            args=(S,),
+                            method='SLSQP',
+                            bounds=bounds,
+                            constraints=constraints,
+                            options={'maxiter': 1000, 'ftol': 1e-9}
+                        )
+                    
+                    metodo_usado = f"Markowitz ({modo_markowitz})"
+                
+                # ========== MÉTODO 2: BLACK-LITTERMAN ==========
+                elif metodo_principal == "Black-Litterman":
+                    # Preparar inputs do Black-Litterman
+                    market_caps = np.array(st.session_state['market_caps_bl']) / 100
+                    
+                    # Construir matriz de views (P) e vetor de retornos esperados (Q)
+                    if st.session_state['bl_views']:
+                        num_views = len(st.session_state['bl_views'])
+                        P = np.zeros((num_views, num_assets))
+                        Q = np.zeros(num_views)
+                        omega_diag = np.zeros(num_views)
+                        
+                        for i, view in enumerate(st.session_state['bl_views']):
+                            ativo_idx = ativos_esperados.index(view['ativo'])
+                            P[i, ativo_idx] = 1.0  # View absoluta sobre um ativo
+                            Q[i] = view['retorno'] / 100
+                            # Omega: incerteza da view (inverso da confiança)
+                            omega_diag[i] = 0.01 / view['confianca']  # Quanto maior confiança, menor incerteza
+                        
+                        omega = np.diag(omega_diag)
+                    else:
+                        # Sem views: usa apenas equilíbrio de mercado (Pi)
+                        P = np.zeros((1, num_assets))
+                        P[0, 0] = 1.0  # View dummy
+                        Q = np.array([0.0])
+                        omega = np.diag([1e10])  # Incerteza infinita = ignora a view
+                    
+                    # Parâmetro tau (incerteza no equilíbrio)
+                    tau = 0.025
+                    
+                    # Executa Black-Litterman
+                    mu_bl = black_litterman(S, market_caps, tau, P, Q, omega)
+                    
+                    # Agora usa os retornos BL no Markowitz (Máximo Sharpe)
                     constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
                     
                     opt_result = minimize(
                         neg_sharpe_ratio, 
                         init_guess, 
-                        args=(mu, S, risk_free_rate), 
+                        args=(mu_bl, S, risk_free_rate), 
                         method='SLSQP', 
                         bounds=bounds, 
                         constraints=constraints,
                         options={'maxiter': 1000, 'ftol': 1e-9}
                     )
-                else:
-                    # Modo 2: MINIMIZAR RISCO (Carteira de Mínima Variância)
-                    # Minimiza apenas a volatilidade, sem restrição de retorno
-                    constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
                     
-                    opt_result = minimize(
-                        portfolio_vol,  # Minimiza APENAS a volatilidade
-                        init_guess,
-                        args=(S,),  # Só precisa da matriz de covariância
-                        method='SLSQP',
-                        bounds=bounds,
-                        constraints=constraints,
-                        options={'maxiter': 1000, 'ftol': 1e-9}
-                    )
+                    # Atualiza mu para usar nos cálculos de retorno
+                    mu = mu_bl
+                    metodo_usado = "Black-Litterman"
+                
+                # ========== MÉTODO 3: RISK PARITY ==========
+                elif metodo_principal == "Risk Parity":
+                    # Risk Parity ignora restrições de Min/Max e retornos esperados
+                    weights_rp = risk_parity_optimization(S, vol_target_rp)
+                    
+                    # Cria objeto fake de resultado para compatibilidade
+                    class FakeResult:
+                        def __init__(self, x):
+                            self.x = x
+                            self.success = True
+                            self.fun = 0
+                    
+                    opt_result = FakeResult(weights_rp)
+                    metodo_usado = "Risk Parity"
                 
                 if opt_result.success:
                     weights_opt = opt_result.x
@@ -1038,13 +1482,17 @@ elif pagina == "Otimização":
                     
                     with col_chart:
                         fig, ax = plt.subplots(figsize=(10, 5))
-                        ax.plot([v*100 for v in frontier_vols], [r*100 for r in frontier_rets], 'b--', label='Fronteira Eficiente')
+                        
+                        # Fronteira eficiente (apenas para Markowitz e BL)
+                        if metodo_principal != "Risk Parity":
+                            ax.plot([v*100 for v in frontier_vols], [r*100 for r in frontier_rets], 'b--', label='Fronteira Eficiente')
+                        
                         ax.scatter(vol_otima*100, ret_otimo*100, color='red', s=150, zorder=5, label=f'Carteira {perfil_selecionado}')
                         
-                        # Marca o benchmark do perfil (em ambos os modos)
+                        # Marca o benchmark do perfil
                         ax.axhline(y=target_nominal*100, color='green', linestyle=':', linewidth=2, label='Benchmark Perfil')
                         
-                        ax.set_title(f"Risco x Retorno ({perfil_selecionado}) - {modo_otimizacao}")
+                        ax.set_title(f"Risco x Retorno ({perfil_selecionado}) - {metodo_usado}")
                         ax.set_xlabel("Volatilidade Esperada (% a.a.)")
                         ax.set_ylabel("Retorno Esperado (% a.a.)")
                         ax.legend()
@@ -1052,18 +1500,43 @@ elif pagina == "Otimização":
                         st.pyplot(fig)
                         
                     with col_data:
-                        st.info(f"**Método:** {modo_otimizacao}")
+                        st.info(f"**Método:** {metodo_usado}")
                         st.success(f"**Volatilidade:** {vol_otima*100:.2f}%")
                         st.metric("Retorno Otimizado", f"{ret_otimo*100:.2f}%", 
                                  delta=f"{(ret_otimo - target_nominal)*100:+.2f} p.p. vs target")
                         st.metric("Sharpe Ratio", f"{sharpe_otimo:.2f}")
                         
+                        # Info adicional para Black-Litterman
+                        if metodo_principal == "Black-Litterman":
+                            st.caption(f"✓ {len(st.session_state['bl_views'])} view(s) aplicada(s)")
+                        
+                        # Info adicional para Risk Parity
+                        if metodo_principal == "Risk Parity":
+                            st.caption("✓ Contribuição de risco equalizada")
+                        
                         st.markdown("**Alocação Sugerida:**")
                         df_w = pd.DataFrame({"Ativo": ativos, "Peso": weights_opt*100})
-                        st.dataframe(
-                            df_w.style.format({"Peso": "{:.2f}%"}).background_gradient(cmap="Blues"),
-                            use_container_width=True, hide_index=True
-                        )
+                        
+                        # Se Risk Parity, adiciona coluna de contribuição de risco
+                        if metodo_principal == "Risk Parity":
+                            portfolio_var = weights_opt.T @ S @ weights_opt
+                            portfolio_vol = np.sqrt(portfolio_var)
+                            marginal_contrib = S @ weights_opt
+                            risk_contrib = weights_opt * marginal_contrib / portfolio_vol if portfolio_vol > 0 else weights_opt * 0
+                            risk_contrib_pct = (risk_contrib / np.sum(risk_contrib)) * 100 if np.sum(risk_contrib) > 0 else risk_contrib * 0
+                            
+                            df_w['Contribuição Risco (%)'] = risk_contrib_pct
+                            st.dataframe(
+                                df_w.style.format({"Peso": "{:.2f}%", "Contribuição Risco (%)": "{:.2f}%"})
+                                    .background_gradient(subset=['Peso'], cmap="Blues")
+                                    .background_gradient(subset=['Contribuição Risco (%)'], cmap="Greens"),
+                                use_container_width=True, hide_index=True
+                            )
+                        else:
+                            st.dataframe(
+                                df_w.style.format({"Peso": "{:.2f}%"}).background_gradient(cmap="Blues"),
+                                use_container_width=True, hide_index=True
+                            )
                     
                     # === MATRIZ DE CORRELAÇÃO (no final da página) ===
                     st.divider()
@@ -1141,7 +1614,7 @@ elif pagina == "Otimização":
                             <div class="container">
                                 <h1>📊 Relatório de Asset Allocation - {perfil_selecionado}</h1>
                                 <p><strong>Data de Geração:</strong> {datetime.now().strftime("%d/%m/%Y %H:%M:%S")}</p>
-                                <p><strong>Método de Otimização:</strong> {modo_otimizacao}</p>
+                                <p><strong>Método de Otimização:</strong> {metodo_usado}</p>
                                 
                                 <h2>🎯 Resultados da Otimização</h2>
                                 <div>
@@ -1253,3 +1726,15 @@ elif pagina == "Otimização":
             except Exception as e:
                 st.error(f"Erro no Solver: {e}")
                 st.exception(e)
+
+## Para atualizar o codigo online, digitar no console:
+# cd "C:\Users\GabrielHenriqueMarti\Desktop\Asset Allocation"
+
+# 1. Adiciona as alterações
+# git add .
+
+# 2. Cria um commit com descrição
+# git commit -m "Descrição da alteração feita"
+
+# 3. Envia para o GitHub
+# git push
