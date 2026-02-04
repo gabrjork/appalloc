@@ -621,7 +621,7 @@ if pagina == "Benchmark":
     # Carrega configurações salvas ou usa defaults
     default_benchmark_config = {
         'periodo_historico': '5 Anos',
-        'peso_hist': 80.0,
+        'peso_hist': 50.0,
         'override': False,
         'valor_manual': 6.0
     }
@@ -895,7 +895,7 @@ elif pagina == "Cenários Macro":
     drivers = ["CDI", "IPCA", "Juro Real (NTN-B)", "Juro Nominal (2 anos)", "Ibovespa (Nominal)", "IFIX (Nominal)"]
     default_macro = pd.DataFrame(index=drivers)
     default_macro['Bear'] = [14.50, 5.50, 8.50, 15.0, -20.0, -10.0]
-    default_macro['Neutro'] = [13.65, 4.40, 7.50, 13.0, 15.0, 10.0]
+    default_macro['Neutro'] = [13.00, 4.00, 7.35, 13.0, 20.0, 10.0]
     default_macro['Bull'] = [11.00, 3.80, 5.50, 10.0, 40.0, 25.0]
     
     if 'drivers_macro_salvos' in st.session_state:
@@ -1161,8 +1161,8 @@ elif pagina == "Otimização":
         perfil_selecionado = st.radio("Selecione o Perfil:", ["Conservador", "Moderado", "Agressivo"])
     
     if perfil_selecionado == "Conservador":
-        target_final = bench_base - 0.015
-        defaults_min = [0.0, 0.30, 0.10, 0.0, 0.05, 0.0, 0.0, 0.0]
+        target_final = bench_base - 0.01
+        defaults_min = [0.0, 0.50, 0.10, 0.0, 0.05, 0.0, 0.0, 0.0]
         defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
         delta_str = "- 1.00 p.p."
     elif perfil_selecionado == "Moderado":
@@ -1171,8 +1171,8 @@ elif pagina == "Otimização":
         defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
         delta_str = "Benchmark"
     else: # Agressivo
-        target_final = bench_base + 0.015
-        defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
+        target_final = bench_base + 0.01
+        defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
         defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
         delta_str = "+ 1.00 p.p."
 
