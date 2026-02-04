@@ -1200,16 +1200,19 @@ elif pagina == "Otimização":
             defaults_min = [0.0, 0.50, 0.10, 0.0, 0.05, 0.0, 0.0, 0.0]
             defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
             delta_str = "DI + 1.00 p.p."
+            vol_min, vol_max = 0.01, 0.02  # 1% a 2%
         elif perfil_selecionado == "Moderado":
             target_final = bench_base + 0.02
             defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.05, 0.05, 0.0]
             defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
             delta_str = "DI + 2.00 p.p."
+            vol_min, vol_max = 0.03, 0.04  # 3% a 4%
         else: # Agressivo
             target_final = bench_base + 0.03
             defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
             defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
             delta_str = "DI + 3.00 p.p."
+            vol_min, vol_max = 0.05, 0.06  # 5% a 6%
     else:
         # Quando usa benchmark híbrido (padrão)
         if perfil_selecionado == "Conservador":
@@ -1217,16 +1220,23 @@ elif pagina == "Otimização":
             defaults_min = [0.0, 0.50, 0.10, 0.0, 0.05, 0.0, 0.0, 0.0]
             defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
             delta_str = "- 1.00 p.p."
+            vol_min, vol_max = 0.01, 0.02  # 1% a 2%
         elif perfil_selecionado == "Moderado":
             target_final = bench_base
             defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.05, 0.05, 0.0]
             defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
             delta_str = "Benchmark"
+            vol_min, vol_max = 0.03, 0.04  # 3% a 4%
         else: # Agressivo
             target_final = bench_base + 0.01
             defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
             defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
             delta_str = "+ 1.00 p.p."
+            vol_min, vol_max = 0.05, 0.06  # 5% a 6%
+    
+    # Armazena limites de volatilidade no session_state
+    st.session_state['vol_min'] = vol_min
+    st.session_state['vol_max'] = vol_max
 
     ipca_focus = expectativa_ipca
     
@@ -1251,6 +1261,8 @@ elif pagina == "Otimização":
                 delta=delta_str
             )
             st.caption(f"Meta Nominal Equivalente (para o Solver): {target_nominal*100:.2f}%")
+        
+        st.info(f"📊 **Banda de Volatilidade:** {vol_min*100:.0f}% a {vol_max*100:.0f}% a.a.")
 
     # Tabela de Constraints (com persistência por perfil)
     st.subheader(f"Limites de Alocação: {perfil_selecionado}")
@@ -1425,8 +1437,15 @@ elif pagina == "Otimização":
                 # ========== MÉTODO 1: MARKOWITZ ==========
                 if metodo_principal == "Markowitz (MVO)":
                     if modo_markowitz == "Máximo Sharpe Ratio":
-                        # Maximizar Sharpe Ratio
-                        constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                        # Maximizar Sharpe Ratio com restrições de volatilidade
+                        vol_min_perfil = st.session_state.get('vol_min', 0.01)
+                        vol_max_perfil = st.session_state.get('vol_max', 0.10)
+                        
+                        constraints = [
+                            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                            {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
+                            {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
+                        ]
                         
                         opt_result = minimize(
                             neg_sharpe_ratio, 
@@ -1438,8 +1457,15 @@ elif pagina == "Otimização":
                             options={'maxiter': 1000, 'ftol': 1e-9}
                         )
                     else:
-                        # Minimizar Variância
-                        constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                        # Minimizar Variância com restrições de volatilidade
+                        vol_min_perfil = st.session_state.get('vol_min', 0.01)
+                        vol_max_perfil = st.session_state.get('vol_max', 0.10)
+                        
+                        constraints = [
+                            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                            {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
+                            {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
+                        ]
                         
                         opt_result = minimize(
                             portfolio_vol,
@@ -1486,8 +1512,15 @@ elif pagina == "Otimização":
                     # Executa Black-Litterman
                     mu_bl = black_litterman(S, market_caps, tau, P, Q, omega)
                     
-                    # Agora usa os retornos BL no Markowitz (Máximo Sharpe)
-                    constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                    # Agora usa os retornos BL no Markowitz (Máximo Sharpe) com restrições de volatilidade
+                    vol_min_perfil = st.session_state.get('vol_min', 0.01)
+                    vol_max_perfil = st.session_state.get('vol_max', 0.10)
+                    
+                    constraints = [
+                        {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                        {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
+                        {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
+                    ]
                     
                     opt_result = minimize(
                         neg_sharpe_ratio, 
