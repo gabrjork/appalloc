@@ -1201,18 +1201,21 @@ elif pagina == "Otimização":
             defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
             delta_str = "DI + 1.00 p.p."
             vol_min, vol_max = 0.01, 0.02  # 1% a 2%
+            vol_target = 0.015  # Target: 1.5%
         elif perfil_selecionado == "Moderado":
             target_final = bench_base + 0.02
             defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.05, 0.05, 0.0]
             defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
             delta_str = "DI + 2.00 p.p."
             vol_min, vol_max = 0.03, 0.04  # 3% a 4%
+            vol_target = 0.035  # Target: 3.5%
         else: # Agressivo
             target_final = bench_base + 0.03
             defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
             defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
             delta_str = "DI + 3.00 p.p."
             vol_min, vol_max = 0.05, 0.06  # 5% a 6%
+            vol_target = 0.055  # Target: 5.5%
     else:
         # Quando usa benchmark híbrido (padrão)
         if perfil_selecionado == "Conservador":
@@ -1221,22 +1224,26 @@ elif pagina == "Otimização":
             defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
             delta_str = "- 1.00 p.p."
             vol_min, vol_max = 0.01, 0.02  # 1% a 2%
+            vol_target = 0.015  # Target: 1.5%
         elif perfil_selecionado == "Moderado":
             target_final = bench_base
             defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.05, 0.05, 0.0]
             defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
             delta_str = "Benchmark"
             vol_min, vol_max = 0.03, 0.04  # 3% a 4%
+            vol_target = 0.035  # Target: 3.5%
         else: # Agressivo
             target_final = bench_base + 0.01
             defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
             defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
             delta_str = "+ 1.00 p.p."
             vol_min, vol_max = 0.05, 0.06  # 5% a 6%
+            vol_target = 0.055  # Target: 5.5%
     
-    # Armazena limites de volatilidade no session_state
+    # Armazena limites e target de volatilidade no session_state
     st.session_state['vol_min'] = vol_min
     st.session_state['vol_max'] = vol_max
+    st.session_state['vol_target'] = vol_target
 
     ipca_focus = expectativa_ipca
     
@@ -1262,7 +1269,7 @@ elif pagina == "Otimização":
             )
             st.caption(f"Meta Nominal Equivalente (para o Solver): {target_nominal*100:.2f}%")
         
-        st.info(f"📊 **Banda de Volatilidade:** {vol_min*100:.0f}% a {vol_max*100:.0f}% a.a.")
+        st.info(f"🎯 **Target de Volatilidade:** {vol_target*100:.2f}% a.a. (Banda: {vol_min*100:.0f}%-{vol_max*100:.0f}%)")
 
     # Tabela de Constraints (com persistência por perfil)
     st.subheader(f"Limites de Alocação: {perfil_selecionado}")
@@ -1426,6 +1433,21 @@ elif pagina == "Otimização":
                 vol = portfolio_vol(weights, cov_matrix)
                 return -(ret - risk_free) / vol if vol > 0 else 1e10
             
+            def objective_with_vol_target(weights, mu, cov_matrix, vol_target, risk_free=0.0, lambda_vol=0.5):
+                """Função objetivo que balanceia Sharpe Ratio com proximidade ao target de volatilidade
+                lambda_vol controla o peso do desvio de volatilidade (0=ignora vol, 1=prioriza vol)
+                """
+                ret = np.dot(weights, mu)
+                vol = portfolio_vol(weights, cov_matrix)
+                sharpe = (ret - risk_free) / vol if vol > 0 else -1e10
+                
+                # Penalidade por desvio do target de volatilidade (normalizada)
+                vol_penalty = ((vol - vol_target) / vol_target) ** 2
+                
+                # Combina Sharpe (queremos maximizar) com penalidade de vol (queremos minimizar)
+                # Retorna valor para MINIMIZAÇÃO
+                return -sharpe + lambda_vol * vol_penalty
+            
             # Chute inicial: pesos iguais
             init_guess = num_assets * [1. / num_assets,]
             
@@ -1437,7 +1459,8 @@ elif pagina == "Otimização":
                 # ========== MÉTODO 1: MARKOWITZ ==========
                 if metodo_principal == "Markowitz (MVO)":
                     if modo_markowitz == "Máximo Sharpe Ratio":
-                        # Maximizar Sharpe Ratio com restrições de volatilidade
+                        # Maximizar Sharpe Ratio buscando target de volatilidade
+                        vol_target_perfil = st.session_state.get('vol_target', 0.03)
                         vol_min_perfil = st.session_state.get('vol_min', 0.01)
                         vol_max_perfil = st.session_state.get('vol_max', 0.10)
                         
@@ -1448,29 +1471,28 @@ elif pagina == "Otimização":
                         ]
                         
                         opt_result = minimize(
-                            neg_sharpe_ratio, 
+                            objective_with_vol_target, 
                             init_guess, 
-                            args=(mu, S, risk_free_rate), 
+                            args=(mu, S, vol_target_perfil, risk_free_rate, 0.3),  # lambda_vol=0.3 (30% peso para vol target)
                             method='SLSQP', 
                             bounds=bounds, 
                             constraints=constraints,
                             options={'maxiter': 1000, 'ftol': 1e-9}
                         )
                     else:
-                        # Minimizar Variância com restrições de volatilidade
-                        vol_min_perfil = st.session_state.get('vol_min', 0.01)
-                        vol_max_perfil = st.session_state.get('vol_max', 0.10)
+                        # Minimizar Variância buscando target de volatilidade
+                        vol_target_perfil = st.session_state.get('vol_target', 0.03)
                         
+                        # Para mínima variância, usa o target como restrição de igualdade
                         constraints = [
                             {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
-                            {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
-                            {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
+                            {'type': 'eq', 'fun': lambda x: portfolio_vol(x, S) - vol_target_perfil}  # vol = vol_target
                         ]
                         
+                        # Maximiza retorno dado o target de volatilidade
                         opt_result = minimize(
-                            portfolio_vol,
+                            lambda x: -np.dot(x, mu),  # Maximiza retorno
                             init_guess,
-                            args=(S,),
                             method='SLSQP',
                             bounds=bounds,
                             constraints=constraints,
@@ -1512,7 +1534,8 @@ elif pagina == "Otimização":
                     # Executa Black-Litterman
                     mu_bl = black_litterman(S, market_caps, tau, P, Q, omega)
                     
-                    # Agora usa os retornos BL no Markowitz (Máximo Sharpe) com restrições de volatilidade
+                    # Agora usa os retornos BL no Markowitz com target de volatilidade
+                    vol_target_perfil = st.session_state.get('vol_target', 0.03)
                     vol_min_perfil = st.session_state.get('vol_min', 0.01)
                     vol_max_perfil = st.session_state.get('vol_max', 0.10)
                     
@@ -1523,9 +1546,9 @@ elif pagina == "Otimização":
                     ]
                     
                     opt_result = minimize(
-                        neg_sharpe_ratio, 
+                        objective_with_vol_target, 
                         init_guess, 
-                        args=(mu_bl, S, risk_free_rate), 
+                        args=(mu_bl, S, vol_target_perfil, risk_free_rate, 0.3),  # lambda_vol=0.3
                         method='SLSQP', 
                         bounds=bounds, 
                         constraints=constraints,
@@ -1556,6 +1579,10 @@ elif pagina == "Otimização":
                     ret_otimo = np.dot(weights_opt, mu)
                     vol_otima = portfolio_vol(weights_opt, S)
                     sharpe_otimo = (ret_otimo - risk_free_rate) / vol_otima if vol_otima > 0 else 0
+                    
+                    # Calcula % do CDI (primeiro ativo é sempre CDI)
+                    retorno_cdi = mu[0]  # Retorno esperado do CDI
+                    percentual_cdi = (ret_otimo / retorno_cdi * 100) if retorno_cdi > 0 else 0
                     
                     # 2.2. GERAÇÃO DA FRONTEIRA
                     ret_min_possible = np.min(mu)
@@ -1600,8 +1627,22 @@ elif pagina == "Otimização":
                     with col_data:
                         st.info(f"**Método:** {metodo_usado}")
                         st.success(f"**Volatilidade:** {vol_otima*100:.2f}%")
+                        
+                        # Verifica se está dentro da banda e mostra distância do target
+                        vol_min_ref = st.session_state.get('vol_min', 0.01)
+                        vol_max_ref = st.session_state.get('vol_max', 0.10)
+                        vol_target_ref = st.session_state.get('vol_target', 0.03)
+                        
+                        if vol_min_ref <= vol_otima <= vol_max_ref:
+                            desvio_target = abs(vol_otima - vol_target_ref) * 100
+                            st.caption(f"✅ Dentro da banda ({vol_min_ref*100:.0f}%-{vol_max_ref*100:.0f}%) | Target: {vol_target_ref*100:.2f}% (desvio: {desvio_target:.2f}pp)")
+                        else:
+                            st.caption(f"⚠️ Fora da banda ({vol_min_ref*100:.0f}%-{vol_max_ref*100:.0f}%) | Target: {vol_target_ref*100:.2f}%")
+                        
                         st.metric("Retorno Otimizado", f"{ret_otimo*100:.2f}%", 
                                  delta=f"{(ret_otimo - target_nominal)*100:+.2f} p.p. vs target")
+                        st.caption(f"📊 **{percentual_cdi:.1f}% do CDI** (CDI esperado: {retorno_cdi*100:.2f}%)")
+                        
                         st.metric("Sharpe Ratio", f"{sharpe_otimo:.2f}")
                         
                         # Info adicional para Black-Litterman
