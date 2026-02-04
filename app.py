@@ -1229,15 +1229,28 @@ elif pagina == "Otimização":
             delta_str = "+ 1.00 p.p."
 
     ipca_focus = expectativa_ipca
-    target_nominal = ((1 + target_final) * (1 + ipca_focus)) - 1
+    
+    # Quando usa DI Futuro, o target já está nominal, não precisa somar IPCA
+    if usar_di_futuro_opt:
+        target_nominal = target_final
+    else:
+        target_nominal = ((1 + target_final) * (1 + ipca_focus)) - 1
 
     with col_target:
-        st.metric(
-            label=f"Meta de Retorno Real ({perfil_selecionado})", 
-            value=f"{target_final*100:.2f}% + IPCA",
-            delta=delta_str
-        )
-        st.caption(f"Meta Nominal Equivalente (para o Solver): {target_nominal*100:.2f}%")
+        if usar_di_futuro_opt:
+            st.metric(
+                label=f"Meta de Retorno Nominal ({perfil_selecionado})", 
+                value=f"{target_final*100:.2f}%",
+                delta=delta_str
+            )
+            st.caption(f"Meta Nominal (para o Solver): {target_nominal*100:.2f}%")
+        else:
+            st.metric(
+                label=f"Meta de Retorno Real ({perfil_selecionado})", 
+                value=f"{target_final*100:.2f}% + IPCA",
+                delta=delta_str
+            )
+            st.caption(f"Meta Nominal Equivalente (para o Solver): {target_nominal*100:.2f}%")
 
     # Tabela de Constraints (com persistência por perfil)
     st.subheader(f"Limites de Alocação: {perfil_selecionado}")
