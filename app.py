@@ -667,8 +667,8 @@ if pagina == "Benchmark":
             st.caption("⚠️ Ponderação desabilitada - usando DI Futuro 1Y")
     
     if usar_di_futuro:
-        # Converte DI nominal para real (descontando IPCA)
-        benchmark_calc = ((1 + taxa_di_1y) / (1 + expectativa_ipca)) - 1
+        # Usa DI Futuro 1Y nominal (PRE) direto da ETTJ 252 dias úteis
+        benchmark_calc = taxa_di_1y
     else:
         benchmark_calc = (media_hist_selecionada * peso_hist) + (taxa_real_ex_ante * peso_mkt)
     
@@ -676,10 +676,10 @@ if pagina == "Benchmark":
         if usar_di_futuro:
             st.markdown("**Benchmark: DI Futuro (1Y)**")
             st.metric(
-                "Target Base (DI 1Y em termos reais)", 
+                "Target Base (DI 1Y Nominal - PRE)", 
                 f"{benchmark_calc*100:.2f}%",
-                delta="DI Futuro",
-                help=f"Benchmark baseado no DI Futuro 1Y ({taxa_di_1y*100:.2f}% nominal), deflacionado pelo IPCA esperado ({expectativa_ipca*100:.2f}%). Os perfis usarão: Conservador = DI+1pp, Moderado = DI+2pp, Agressivo = DI+3pp."
+                delta="DI Futuro PRE",
+                help=f"Benchmark baseado no DI Futuro 1Y ({taxa_di_1y*100:.2f}% nominal) extraído da ETTJ PRE para 252 dias úteis. Os perfis usarão: Conservador = DI+1pp, Moderado = DI+2pp, Agressivo = DI+3pp."
             )
         else:
             st.markdown("**Benchmark Calculado (IPCA + X%)**")
