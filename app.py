@@ -623,9 +623,20 @@ if pagina == "Benchmark":
         'periodo_historico': '5 Anos',
         'peso_hist': 50.0,
         'override': False,
-        'valor_manual': 6.0
+        'valor_manual': 6.0,
+        'usar_di_futuro': False
     }
     saved_benchmark_config = st.session_state.get('benchmark_config_salvo', default_benchmark_config)
+    
+    # Opção de usar DI Futuro 1Y como benchmark
+    usar_di_futuro = st.checkbox(
+        "📊 Usar DI Futuro (1Y) como Benchmark",
+        value=saved_benchmark_config.get('usar_di_futuro', False),
+        key="usar_di_futuro_checkbox",
+        help=f"Quando marcado, o benchmark será o DI Futuro 1Y ({taxa_di_1y*100:.2f}%) ao invés do cálculo híbrido. Os targets das carteiras serão: Conservador = DI+1pp, Moderado = DI+2pp, Agressivo = DI+3pp."
+    )
+    
+    st.session_state['usar_di_futuro'] = usar_di_futuro
     
     col_in1, col_in2 = st.columns([1, 2])
     with col_in1:
@@ -636,7 +647,8 @@ if pagina == "Benchmark":
             "Período Histórico de Referência:",
             options=['5 Anos', 'Período Completo (Desde 2005)'],
             index=0 if saved_benchmark_config['periodo_historico'] == '5 Anos' else 1,
-            key="periodo_historico"
+            key="periodo_historico",
+            disabled=usar_di_futuro
         )
         
         # Define qual média usar baseado na seleção
@@ -647,24 +659,41 @@ if pagina == "Benchmark":
             media_hist_selecionada = media_total_ex_post
             label_periodo = "Período Completo"
         
-        peso_hist = st.slider("Peso Histórico (%)", 0, 100, int(saved_benchmark_config['peso_hist']), 5, key="peso_hist_slider") / 100
+        peso_hist = st.slider("Peso Histórico (%)", 0, 100, int(saved_benchmark_config['peso_hist']), 5, key="peso_hist_slider", disabled=usar_di_futuro) / 100
         peso_mkt = 1 - peso_hist
-        st.caption(f"Histórico ({label_periodo}): {peso_hist*100:.0f}% | Mercado (Ex-Ante): {peso_mkt*100:.0f}%")
+        if not usar_di_futuro:
+            st.caption(f"Histórico ({label_periodo}): {peso_hist*100:.0f}% | Mercado (Ex-Ante): {peso_mkt*100:.0f}%")
+        else:
+            st.caption("⚠️ Ponderação desabilitada - usando DI Futuro 1Y")
     
-    benchmark_calc = (media_hist_selecionada * peso_hist) + (taxa_real_ex_ante * peso_mkt)
+    if usar_di_futuro:
+        # Converte DI nominal para real (descontando IPCA)
+        benchmark_calc = ((1 + taxa_di_1y) / (1 + expectativa_ipca)) - 1
+    else:
+        benchmark_calc = (media_hist_selecionada * peso_hist) + (taxa_real_ex_ante * peso_mkt)
     
     with col_in2:
-        st.markdown("**Benchmark Calculado (IPCA + X%)**")
-        st.metric(
-            "Target Final Sugerido", 
-            f"{benchmark_calc*100:.2f}%",
-            help=f"Meta de juro real híbrida calculada como: ({peso_hist*100:.0f}% × {media_hist_selecionada*100:.2f}% histórico) + ({peso_mkt*100:.0f}% × {taxa_real_ex_ante*100:.2f}% mercado). Esta será a meta de retorno real das carteiras (IPCA + X%). Carteiras conservadoras terão meta inferior, agressivas superior."
-        )
+        if usar_di_futuro:
+            st.markdown("**Benchmark: DI Futuro (1Y)**")
+            st.metric(
+                "Target Base (DI 1Y em termos reais)", 
+                f"{benchmark_calc*100:.2f}%",
+                delta="DI Futuro",
+                help=f"Benchmark baseado no DI Futuro 1Y ({taxa_di_1y*100:.2f}% nominal), deflacionado pelo IPCA esperado ({expectativa_ipca*100:.2f}%). Os perfis usarão: Conservador = DI+1pp, Moderado = DI+2pp, Agressivo = DI+3pp."
+            )
+        else:
+            st.markdown("**Benchmark Calculado (IPCA + X%)**")
+            st.metric(
+                "Target Final Sugerido", 
+                f"{benchmark_calc*100:.2f}%",
+                help=f"Meta de juro real híbrida calculada como: ({peso_hist*100:.0f}% × {media_hist_selecionada*100:.2f}% histórico) + ({peso_mkt*100:.0f}% × {taxa_real_ex_ante*100:.2f}% mercado). Esta será a meta de retorno real das carteiras (IPCA + X%). Carteiras conservadoras terão meta inferior, agressivas superior."
+            )
         
         override = st.checkbox(
             "Sobrepor valor calculado manualmente?", 
             value=saved_benchmark_config['override'], 
             key="override_checkbox",
+            disabled=usar_di_futuro,
             help="Marque esta opção para ignorar o cálculo automático e definir uma meta customizada. Útil quando você tem uma expectativa específica que difere do modelo."
         )
         if override:
@@ -687,7 +716,8 @@ if pagina == "Benchmark":
                 'periodo_historico': periodo_historico,
                 'peso_hist': peso_hist * 100,
                 'override': override,
-                'valor_manual': benchmark_final * 100 if override else benchmark_calc * 100
+                'valor_manual': benchmark_final * 100 if override else benchmark_calc * 100,
+                'usar_di_futuro': usar_di_futuro
             }
             st.success("✅ Configuração do Benchmark salva!")
             st.rerun()
@@ -1160,21 +1190,43 @@ elif pagina == "Otimização":
     with col_perf:
         perfil_selecionado = st.radio("Selecione o Perfil:", ["Conservador", "Moderado", "Agressivo"])
     
-    if perfil_selecionado == "Conservador":
-        target_final = bench_base - 0.01
-        defaults_min = [0.0, 0.50, 0.10, 0.0, 0.05, 0.0, 0.0, 0.0]
-        defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
-        delta_str = "- 1.00 p.p."
-    elif perfil_selecionado == "Moderado":
-        target_final = bench_base
-        defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.05, 0.05, 0.0]
-        defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
-        delta_str = "Benchmark"
-    else: # Agressivo
-        target_final = bench_base + 0.01
-        defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
-        defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
-        delta_str = "+ 1.00 p.p."
+    # Verifica se está usando DI Futuro como benchmark
+    usar_di_futuro_opt = st.session_state.get('usar_di_futuro', False)
+    
+    if usar_di_futuro_opt:
+        # Quando usa DI Futuro: Conservador = DI+1pp, Moderado = DI+2pp, Agressivo = DI+3pp
+        if perfil_selecionado == "Conservador":
+            target_final = bench_base + 0.01
+            defaults_min = [0.0, 0.50, 0.10, 0.0, 0.05, 0.0, 0.0, 0.0]
+            defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
+            delta_str = "DI + 1.00 p.p."
+        elif perfil_selecionado == "Moderado":
+            target_final = bench_base + 0.02
+            defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.05, 0.05, 0.0]
+            defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
+            delta_str = "DI + 2.00 p.p."
+        else: # Agressivo
+            target_final = bench_base + 0.03
+            defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
+            defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
+            delta_str = "DI + 3.00 p.p."
+    else:
+        # Quando usa benchmark híbrido (padrão)
+        if perfil_selecionado == "Conservador":
+            target_final = bench_base - 0.01
+            defaults_min = [0.0, 0.50, 0.10, 0.0, 0.05, 0.0, 0.0, 0.0]
+            defaults_max = [0.0, 0.80, 0.40, 0.20, 0.20, 0.10, 0.0, 0.0]
+            delta_str = "- 1.00 p.p."
+        elif perfil_selecionado == "Moderado":
+            target_final = bench_base
+            defaults_min = [0.0, 0.20, 0.10, 0.0, 0.05, 0.05, 0.05, 0.0]
+            defaults_max = [0.0, 0.60, 0.40, 0.20, 0.25, 0.20, 0.10, 0.10]
+            delta_str = "Benchmark"
+        else: # Agressivo
+            target_final = bench_base + 0.01
+            defaults_min = [0.0, 0.10, 0.10, 0.0, 0.05, 0.10, 0.05, 0.05]
+            defaults_max = [0.0, 0.40, 0.40, 0.20, 0.30, 0.35, 0.15, 0.15]
+            delta_str = "+ 1.00 p.p."
 
     ipca_focus = expectativa_ipca
     target_nominal = ((1 + target_final) * (1 + ipca_focus)) - 1
