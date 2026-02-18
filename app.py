@@ -73,17 +73,60 @@ def get_expectativa_inflacao_12m():
 
 @st.cache_data
 def get_ettj_1ano():
-    for i in range(0, 5):
+    """Busca taxa pré do vértice 252 dias (DI Futuro 1Y) da ETTJ usando ANBIMA"""
+    for i in range(0, 10):  # Busca até 10 dias atrás
         data_busca = datetime.now() - timedelta(days=i)
+        # Pula finais de semana
+        if data_busca.weekday() >= 5:  # 5=sábado, 6=domingo
+            continue
+        
         data_str = data_busca.strftime("%d/%m/%Y")
         try:
-            curva = pyettj.get_ettj(data_str)
-            if not curva.empty and 'Dias Corridos' in curva.columns:
-                curva = curva.sort_values('Dias Corridos')
-                f_interp = interpolate.interp1d(curva['Dias Corridos'], curva['DI x pré 252'], kind='linear', fill_value="extrapolate")
-                return float(f_interp(365)) / 100, data_str
-        except Exception:
+            # USA get_ettj_anbima() para obter vértices padronizados da ANBIMA
+            # Retorna tupla: (params_svensson, vertices_anbima, prefixados, titulos)
+            resultado = pyettj.get_ettj_anbima(data_str)
+            curva = resultado[1]  # Pega o DataFrame de vértices (índice 1)
+            
+            # Colunas: ['Vertice', 'IPCA', 'Prefixados', 'Inflação Implícita']
+            if not curva.empty and 'Vertice' in curva.columns and 'Prefixados' in curva.columns:
+                # Converte colunas para numérico (trata formatação brasileira)
+                # Remove pontos de milhar ANTES de converter (ex: "1.008" → "1008")
+                curva['Vertice'] = curva['Vertice'].apply(lambda x: str(x).replace('.', ''))
+                curva['Vertice'] = pd.to_numeric(curva['Vertice'], errors='coerce')
+                # Converte taxas: troca vírgula por ponto (ex: "13,0208" → 13.0208)
+                curva['Prefixados'] = curva['Prefixados'].apply(
+                    lambda x: float(str(x).replace(',', '.')) if pd.notna(x) and str(x).strip() != '' else None
+                )
+                # Remove linhas com valores vazios
+                curva = curva.dropna(subset=['Vertice', 'Prefixados'])
+                curva = curva.sort_values('Vertice')
+                
+                # Com get_ettj_anbima(), o vértice 252 deve existir exatamente
+                if 252 in curva['Vertice'].values:
+                    taxa = curva[curva['Vertice'] == 252]['Prefixados'].iloc[0]
+                    valor_interpolado = False
+                else:
+                    # Fallback: interpola se não existir
+                    f_interp = interpolate.interp1d(curva['Vertice'], curva['Prefixados'], 
+                                                   kind='linear', fill_value="extrapolate")
+                    taxa = float(f_interp(252))
+                    valor_interpolado = True
+                
+                # Debug: salva info da curva
+                vertice_252_row = curva[curva['Vertice'] == 252] if 252 in curva['Vertice'].values else None
+                st.session_state['debug_ettj_di1y'] = {
+                    'data': data_str,
+                    'vertice_252_existe': (252 in curva['Vertice'].values),
+                    'taxa_retornada': taxa,
+                    'foi_interpolado': valor_interpolado,
+                    'vertice_252_row': vertice_252_row.to_dict('records') if vertice_252_row is not None and not vertice_252_row.empty else None
+                }
+                
+                return taxa / 100, data_str  # Já vem em %
+        except Exception as e:
+            st.session_state['debug_ettj_di1y_error'] = f"Erro em {data_str}: {str(e)}"
             continue
+    
     return 0.12, "Erro/Fallback"
 
 @st.cache_data
@@ -367,11 +410,19 @@ def fetch_comdinheiro_data(user, password):
     """
     url = "https://api.comdinheiro.com.br/v1/ep1/import-data"
     
+    # Calcula o último dia útil disponível (hoje ou dia anterior se hoje não for útil)
+    data_fim = datetime.now()
+    # Se hoje é fim de semana, retrocede para sexta-feira
+    while data_fim.weekday() >= 5:  # 5=sábado, 6=domingo
+        data_fim = data_fim - timedelta(days=1)
+    # Formata no padrão ddmmyyyy para a API
+    data_fim_str = data_fim.strftime("%d%m%Y")
+    
     # Payload com JSON2 e max_list_size=10000
     # REMOVIDO cabecalho_excel=modo1 que pode estar causando retorno apenas de metadados
     payload = (
         f"username={user}&password={password}&"
-        "URL=HistoricoCotacao002.php%3F%26x%3Dcdi%2Bibov%2Bifix%2Banbima_imab%2Banbima_irfm%2Banbima_idadi%2Banbima_ihfa%2Banbima_imab5%25BE%26data_ini%3D04012013%26data_fim%3D05122025%26pagina%3D1%26d%3DMOEDA_ORIGINAL%26g%3D1%26m%3D0%26info_desejada%3Dretorno%26retorno%3Ddiscreto%26tipo_data%3Ddu_br%26tipo_ajuste%3Dtodosajustes%26num_casas%3D2%26enviar_email%3D0%26ordem_legenda%3D1%26classes_ativos%3Dfklk448oj5v5r%26ordem_data%3D0%26rent_acum%3Drent_acum%26minY%3D%26maxY%3D%26deltaY%3D%26preco_nd_ant%3D0%26base_num_indice%3D100%26flag_num_indice%3D0%26eixo_x%3DData%26startX%3D0%26max_list_size%3D10000%26line_width%3D2%26titulo_grafico%3D%26legenda_eixoy%3D%26tipo_grafico%3Dline%26script%3D%26tooltip%3Dunica&format=json2"
+        f"URL=HistoricoCotacao002.php%3F%26x%3Dcdi%2Bibov%2Bifix%2Banbima_imab%2Banbima_irfm%2Banbima_idadi%2Banbima_ihfa%2Banbima_imab5%25BE%26data_ini%3D04012016%26data_fim%3D{data_fim_str}%26pagina%3D1%26d%3DMOEDA_ORIGINAL%26g%3D1%26m%3D0%26info_desejada%3Dretorno%26retorno%3Ddiscreto%26tipo_data%3Ddu_br%26tipo_ajuste%3Dtodosajustes%26num_casas%3D2%26enviar_email%3D0%26ordem_legenda%3D1%26classes_ativos%3Dfklk448oj5v5r%26ordem_data%3D0%26rent_acum%3Drent_acum%26minY%3D%26maxY%3D%26deltaY%3D%26preco_nd_ant%3D0%26base_num_indice%3D100%26flag_num_indice%3D0%26eixo_x%3DData%26startX%3D0%26max_list_size%3D10000%26line_width%3D2%26titulo_grafico%3D%26legenda_eixoy%3D%26tipo_grafico%3Dline%26script%3D%26tooltip%3Dunica&format=json2"
     )
     
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
@@ -737,7 +788,7 @@ elif pagina == "Cenários Macro":
     st.title("Premissas e Cenários Macroeconômicos")
     
     bench_ref = st.session_state.get('benchmark_final', 0.06)
-    st.info(f"O Benchmark definido na etapa anterior foi **IPCA + {bench_ref*100:.2f}%**. As projeções abaixo devem buscar consistência com este alvo.")
+    st.info(f"O Benchmark definido na etapa anterior foi **{bench_ref*100:.2f}%**. As projeções abaixo devem buscar consistência com este alvo.")
 
     st.markdown("""
     Esta etapa utiliza uma abordagem **Top-Down**. Primeiro, definimos os cenários para as variáveis macroeconômicas (Drivers).
@@ -994,6 +1045,70 @@ elif pagina == "Cenários Macro":
     O **Retorno Esperado (Ponderado)** será utilizado como input para a otimização de Markowitz.
     """)
     
+    # Expander explicando como funcionam os retornos esperados
+    with st.expander("ℹ️ Como são calculados os Retornos Esperados?", expanded=False):
+        st.markdown("""
+        ### 📊 Metodologia de Cálculo dos Retornos
+        
+        Os retornos esperados são calculados através de uma **abordagem forward-looking baseada em cenários**:
+        
+        #### 1️⃣ **Cenários Macroeconômicos (Bear, Neutro, Bull)**
+        Você define projeções para as principais variáveis macro em cada cenário:
+        - CDI, IPCA, Juro Real (NTN-B), Juro Nominal (2 anos)
+        - Ibovespa e IFIX
+        
+        #### 2️⃣ **Probabilidades dos Cenários**
+        Atribui pesos a cada cenário conforme sua convicção sobre a probabilidade de ocorrência.
+        
+        #### 3️⃣ **Pricing dos Ativos por Classe**
+        Para cada classe de ativo, o modelo aplica regras específicas:
+        
+        **Renda Fixa:**
+        - **CDI (Caixa)**: Usa diretamente a taxa CDI do cenário
+        - **IDA-DI (Crédito)**: CDI + spread de 1%
+        - **IMA-B (Inflação)**: Calcula marcação a mercado considerando:
+          - Ganho/perda de capital pela variação da taxa real (vs. ETTJ atual)
+          - Duration do IMA-B para sensitivity
+          - Retorno: (1 + ganho_capital) × (1 + juro_real) × (1 + IPCA) - 1
+        - **IRF-M (Pré-fixado)**: Similar ao IMA-B, mas com taxa nominal
+        - **IMA-B 5+ (Ilíquidos)**: Prêmio de liquidez de 12% real + IPCA
+        
+        **Ativos de Risco:**
+        - **IBOV (Ações BR)**: Retorno nominal projetado no cenário
+        - **IFIX (FIIs)**: Retorno nominal projetado no cenário
+        - **IHFA (Multimercado)**: CDI × 1.15 (alfa esperado)
+        
+        #### 4️⃣ **Ponderação Final**
+        O **Retorno Esperado (%)** é a média ponderada:
+        ```
+        E[R] = (Prob_Bear × R_Bear) + (Prob_Neutro × R_Neutro) + (Prob_Bull × R_Bull)
+        ```
+        
+        #### 5️⃣ **Uso na Otimização**
+        Este vetor de retornos esperados **E[R]** é o input μ (mu) no modelo de Markowitz, 
+        combinado com a matriz de covariância histórica para calcular a alocação ótima.
+        
+        ---
+        
+        ### 🔄 Dados da API Comdinheiro
+        
+        **Retornos Históricos Diários:**
+        - A API fornece séries históricas de retornos diários de cada índice
+        - Período: configurável (ex: últimos 2-5 anos)
+        - Uso: calcular a **matriz de covariância** (volatilidades e correlações)
+        
+        **Matriz de Covariância Anualizada:**
+        ```python
+        cov_matrix = df_returns.cov() * 252  # Anualiza: 252 dias úteis/ano
+        ```
+        
+        **Separação clara:**
+        - **Retornos Esperados (μ)**: Forward-looking, seus cenários (acima)
+        - **Covariância (Σ)**: Baseada em dados históricos da API
+        
+        Esta combinação (views + histórico) é a essência do modelo Black-Litterman!
+        """)
+    
     st.dataframe(
         df_ativos,
         column_config={
@@ -1010,6 +1125,68 @@ elif pagina == "Cenários Macro":
         },
         use_container_width=True
     )
+    
+    # Adiciona visualização das volatilidades históricas
+    st.divider()
+    st.subheader("5. Volatilidades Históricas (Input Markowitz)")
+    st.markdown("""
+    As volatilidades abaixo são calculadas a partir dos **dados históricos da API Comdinheiro** 
+    e serão utilizadas na matriz de covariância do modelo de Markowitz.
+    """)
+    
+    # Busca dados históricos se disponíveis
+    if 'df_returns_api' in st.session_state:
+        df_returns_hist = st.session_state['df_returns_api']
+        
+        # Calcula volatilidades anualizadas para cada ativo
+        vol_anualizada = df_returns_hist.std() * np.sqrt(252) * 100  # Em percentual
+        
+        # Cria DataFrame formatado
+        df_vol = pd.DataFrame({
+            'Ativo': vol_anualizada.index,
+            'Volatilidade (% a.a.)': vol_anualizada.values
+        })
+        
+        # Adiciona informações adicionais
+        col_info1, col_info2 = st.columns([2, 1])
+        
+        with col_info1:
+            st.dataframe(
+                df_vol,
+                column_config={
+                    "Volatilidade (% a.a.)": st.column_config.ProgressColumn(
+                        "Vol. Anualizada",
+                        format="%.2f%%",
+                        min_value=0,
+                        max_value=50,
+                        help="Volatilidade histórica anualizada (desvio padrão × √252)",
+                    ),
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        
+        with col_info2:
+            st.metric(
+                "Período dos Dados",
+                f"{len(df_returns_hist)} dias",
+                help="Quantidade de dias úteis nos dados históricos"
+            )
+            st.metric(
+                "Data Início",
+                df_returns_hist.index[0].strftime('%d/%m/%Y') if hasattr(df_returns_hist.index[0], 'strftime') else str(df_returns_hist.index[0])
+            )
+            st.metric(
+                "Data Fim",
+                df_returns_hist.index[-1].strftime('%d/%m/%Y') if hasattr(df_returns_hist.index[-1], 'strftime') else str(df_returns_hist.index[-1])
+            )
+        
+        st.caption("💡 **Nota**: Estas volatilidades representam o risco histórico de cada ativo. Na otimização de Markowitz, "
+                  "a matriz de covariância completa (incluindo correlações) é utilizada para calcular o risco do portfólio.")
+        
+    else:
+        st.warning("⚠️ Dados históricos não carregados. As volatilidades serão calculadas quando você baixar os dados na página de Otimização.")
+        st.info("👉 Vá para a página **Otimização** e clique em **'📥 Baixar Dados da API'** para carregar os dados históricos.")
     
     st.session_state['premissas_retorno'] = df_ativos
 
@@ -1240,11 +1417,9 @@ elif pagina == "Otimização":
             vol_min, vol_max = 0.05, 0.06  # 5% a 6%
             vol_target = 0.055  # Target: 5.5%
     
-    # Armazena limites e target de volatilidade no session_state
-    st.session_state['vol_min'] = vol_min
-    st.session_state['vol_max'] = vol_max
-    st.session_state['vol_target'] = vol_target
-
+    # Armazena limites padrão de volatilidade
+    vol_target_padrao = vol_target
+    
     ipca_focus = expectativa_ipca
     
     # Quando usa DI Futuro, o target já está nominal, não precisa somar IPCA
@@ -1269,7 +1444,47 @@ elif pagina == "Otimização":
             )
             st.caption(f"Meta Nominal Equivalente (para o Solver): {target_nominal*100:.2f}%")
         
-        st.info(f"🎯 **Target de Volatilidade:** {vol_target*100:.2f}% a.a. (Banda: {vol_min*100:.0f}%-{vol_max*100:.0f}%)")
+        # Opção de customizar volatilidade target
+        customizar_vol = st.checkbox(
+            "🎚️ Customizar Target de Volatilidade",
+            value=False,
+            key=f"customizar_vol_{perfil_selecionado}",
+            help="Permite ajustar manualmente o target de volatilidade ao invés de usar o padrão do perfil"
+        )
+        
+        if customizar_vol:
+            # Carrega valor salvo ou usa padrão
+            vol_custom_key = f'vol_custom_{perfil_selecionado}'
+            vol_custom_saved = st.session_state.get(vol_custom_key, vol_target_padrao * 100)
+            
+            col_input, col_btn = st.columns([2, 1])
+            with col_input:
+                vol_target_input = st.number_input(
+                    "Target de Volatilidade (%)",
+                    min_value=vol_min * 100,
+                    max_value=vol_max * 100,
+                    value=vol_custom_saved,
+                    step=0.1,
+                    format="%.2f",
+                    key=f"vol_target_input_{perfil_selecionado}",
+                    help=f"Digite o target de volatilidade dentro da banda do perfil ({vol_min*100:.0f}%-{vol_max*100:.0f}%)"
+                )
+            with col_btn:
+                st.write("")  # Espaçamento para alinhar com input
+                if st.button("💾 Salvar", key=f"save_vol_{perfil_selecionado}", use_container_width=True):
+                    st.session_state[vol_custom_key] = vol_target_input
+                    st.success("✅ Volatilidade salva!")
+                    st.rerun()
+            
+            vol_target = vol_target_input / 100
+            st.caption(f"✏️ Target customizado: {vol_target*100:.2f}% (Padrão: {vol_target_padrao*100:.2f}%)")
+        else:
+            st.info(f"🎯 **Target de Volatilidade:** {vol_target*100:.2f}% a.a. (Banda: {vol_min*100:.0f}%-{vol_max*100:.0f}%)")
+    
+    # Armazena valores finais no session_state
+    st.session_state['vol_min'] = vol_min
+    st.session_state['vol_max'] = vol_max
+    st.session_state['vol_target'] = vol_target
 
     # Tabela de Constraints (com persistência por perfil)
     st.subheader(f"Limites de Alocação: {perfil_selecionado}")
@@ -1580,8 +1795,8 @@ elif pagina == "Otimização":
                     vol_otima = portfolio_vol(weights_opt, S)
                     sharpe_otimo = (ret_otimo - risk_free_rate) / vol_otima if vol_otima > 0 else 0
                     
-                    # Calcula % do CDI (primeiro ativo é sempre CDI)
-                    retorno_cdi = mu[0]  # Retorno esperado do CDI
+                    # Calcula % do CDI usando DI Futuro 1Y (benchmark da primeira página)
+                    retorno_cdi = st.session_state.get('taxa_di_1y', 0.12)  # DI Futuro 1Y da ETTJ
                     percentual_cdi = (ret_otimo / retorno_cdi * 100) if retorno_cdi > 0 else 0
                     
                     # 2.2. GERAÇÃO DA FRONTEIRA
