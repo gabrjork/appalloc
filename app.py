@@ -1480,11 +1480,20 @@ elif pagina == "Otimização":
             st.caption(f"✏️ Target customizado: {vol_target*100:.2f}% (Padrão: {vol_target_padrao*100:.2f}%)")
         else:
             st.info(f"🎯 **Target de Volatilidade:** {vol_target*100:.2f}% a.a. (Banda: {vol_min*100:.0f}%-{vol_max*100:.0f}%)")
+        
+        # Opção de desconsiderar target de volatilidade
+        ignorar_vol_target = st.checkbox(
+            "🚫 Desconsiderar Target de Volatilidade na Otimização",
+            value=False,
+            key=f"ignorar_vol_{perfil_selecionado}",
+            help="Se marcado, a otimização não considerará restrições de volatilidade (busca apenas máximo retorno/Sharpe sem limites de risco)"
+        )
     
     # Armazena valores finais no session_state
     st.session_state['vol_min'] = vol_min
     st.session_state['vol_max'] = vol_max
     st.session_state['vol_target'] = vol_target
+    st.session_state['ignorar_vol_target'] = ignorar_vol_target
 
     # Tabela de Constraints (com persistência por perfil)
     st.subheader(f"Limites de Alocação: {perfil_selecionado}")
@@ -1673,46 +1682,79 @@ elif pagina == "Otimização":
             try:
                 # ========== MÉTODO 1: MARKOWITZ ==========
                 if metodo_principal == "Markowitz (MVO)":
+                    ignorar_vol = st.session_state.get('ignorar_vol_target', False)
+                    
                     if modo_markowitz == "Máximo Sharpe Ratio":
-                        # Maximizar Sharpe Ratio buscando target de volatilidade
-                        vol_target_perfil = st.session_state.get('vol_target', 0.03)
-                        vol_min_perfil = st.session_state.get('vol_min', 0.01)
-                        vol_max_perfil = st.session_state.get('vol_max', 0.10)
-                        
-                        constraints = [
-                            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
-                            {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
-                            {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
-                        ]
-                        
-                        opt_result = minimize(
-                            objective_with_vol_target, 
-                            init_guess, 
-                            args=(mu, S, vol_target_perfil, risk_free_rate, 0.3),  # lambda_vol=0.3 (30% peso para vol target)
-                            method='SLSQP', 
-                            bounds=bounds, 
-                            constraints=constraints,
-                            options={'maxiter': 1000, 'ftol': 1e-9}
-                        )
+                        if ignorar_vol:
+                            # Sem restrições de volatilidade - apenas maximiza Sharpe Ratio
+                            constraints = [
+                                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                            ]
+                            
+                            opt_result = minimize(
+                                neg_sharpe_ratio, 
+                                init_guess, 
+                                args=(mu, S, risk_free_rate),
+                                method='SLSQP', 
+                                bounds=bounds, 
+                                constraints=constraints,
+                                options={'maxiter': 1000, 'ftol': 1e-9}
+                            )
+                        else:
+                            # Maximizar Sharpe Ratio buscando target de volatilidade
+                            vol_target_perfil = st.session_state.get('vol_target', 0.03)
+                            vol_min_perfil = st.session_state.get('vol_min', 0.01)
+                            vol_max_perfil = st.session_state.get('vol_max', 0.10)
+                            
+                            constraints = [
+                                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                                {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
+                                {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
+                            ]
+                            
+                            opt_result = minimize(
+                                objective_with_vol_target, 
+                                init_guess, 
+                                args=(mu, S, vol_target_perfil, risk_free_rate, 0.3),  # lambda_vol=0.3 (30% peso para vol target)
+                                method='SLSQP', 
+                                bounds=bounds, 
+                                constraints=constraints,
+                                options={'maxiter': 1000, 'ftol': 1e-9}
+                            )
                     else:
-                        # Minimizar Variância buscando target de volatilidade
-                        vol_target_perfil = st.session_state.get('vol_target', 0.03)
-                        
-                        # Para mínima variância, usa o target como restrição de igualdade
-                        constraints = [
-                            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
-                            {'type': 'eq', 'fun': lambda x: portfolio_vol(x, S) - vol_target_perfil}  # vol = vol_target
-                        ]
-                        
-                        # Maximiza retorno dado o target de volatilidade
-                        opt_result = minimize(
-                            lambda x: -np.dot(x, mu),  # Maximiza retorno
-                            init_guess,
-                            method='SLSQP',
-                            bounds=bounds,
-                            constraints=constraints,
-                            options={'maxiter': 1000, 'ftol': 1e-9}
-                        )
+                        if ignorar_vol:
+                            # Sem restrições de volatilidade - apenas minimiza variância
+                            constraints = [
+                                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                            ]
+                            
+                            opt_result = minimize(
+                                lambda x: portfolio_vol(x, S),  # Minimiza volatilidade
+                                init_guess,
+                                method='SLSQP',
+                                bounds=bounds,
+                                constraints=constraints,
+                                options={'maxiter': 1000, 'ftol': 1e-9}
+                            )
+                        else:
+                            # Minimizar Variância buscando target de volatilidade
+                            vol_target_perfil = st.session_state.get('vol_target', 0.03)
+                            
+                            # Para mínima variância, usa o target como restrição de igualdade
+                            constraints = [
+                                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                                {'type': 'eq', 'fun': lambda x: portfolio_vol(x, S) - vol_target_perfil}  # vol = vol_target
+                            ]
+                            
+                            # Maximiza retorno dado o target de volatilidade
+                            opt_result = minimize(
+                                lambda x: -np.dot(x, mu),  # Maximiza retorno
+                                init_guess,
+                                method='SLSQP',
+                                bounds=bounds,
+                                constraints=constraints,
+                                options={'maxiter': 1000, 'ftol': 1e-9}
+                            )
                     
                     metodo_usado = f"Markowitz ({modo_markowitz})"
                 
@@ -1749,26 +1791,45 @@ elif pagina == "Otimização":
                     # Executa Black-Litterman
                     mu_bl = black_litterman(S, market_caps, tau, P, Q, omega)
                     
-                    # Agora usa os retornos BL no Markowitz com target de volatilidade
-                    vol_target_perfil = st.session_state.get('vol_target', 0.03)
-                    vol_min_perfil = st.session_state.get('vol_min', 0.01)
-                    vol_max_perfil = st.session_state.get('vol_max', 0.10)
+                    # Verifica se deve ignorar target de volatilidade
+                    ignorar_vol = st.session_state.get('ignorar_vol_target', False)
                     
-                    constraints = [
-                        {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
-                        {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
-                        {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
-                    ]
-                    
-                    opt_result = minimize(
-                        objective_with_vol_target, 
-                        init_guess, 
-                        args=(mu_bl, S, vol_target_perfil, risk_free_rate, 0.3),  # lambda_vol=0.3
-                        method='SLSQP', 
-                        bounds=bounds, 
-                        constraints=constraints,
-                        options={'maxiter': 1000, 'ftol': 1e-9}
-                    )
+                    if ignorar_vol:
+                        # Sem restrições de volatilidade
+                        constraints = [
+                            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+                        ]
+                        
+                        opt_result = minimize(
+                            neg_sharpe_ratio, 
+                            init_guess, 
+                            args=(mu_bl, S, risk_free_rate),
+                            method='SLSQP', 
+                            bounds=bounds, 
+                            constraints=constraints,
+                            options={'maxiter': 1000, 'ftol': 1e-9}
+                        )
+                    else:
+                        # Usa os retornos BL no Markowitz com target de volatilidade
+                        vol_target_perfil = st.session_state.get('vol_target', 0.03)
+                        vol_min_perfil = st.session_state.get('vol_min', 0.01)
+                        vol_max_perfil = st.session_state.get('vol_max', 0.10)
+                        
+                        constraints = [
+                            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                            {'type': 'ineq', 'fun': lambda x: portfolio_vol(x, S) - vol_min_perfil},  # vol >= vol_min
+                            {'type': 'ineq', 'fun': lambda x: vol_max_perfil - portfolio_vol(x, S)}   # vol <= vol_max
+                        ]
+                        
+                        opt_result = minimize(
+                            objective_with_vol_target, 
+                            init_guess, 
+                            args=(mu_bl, S, vol_target_perfil, risk_free_rate, 0.3),  # lambda_vol=0.3
+                            method='SLSQP', 
+                            bounds=bounds, 
+                            constraints=constraints,
+                            options={'maxiter': 1000, 'ftol': 1e-9}
+                        )
                     
                     # Atualiza mu para usar nos cálculos de retorno
                     mu = mu_bl
